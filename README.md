@@ -21,6 +21,29 @@ Le seuil mesuré est net :
 signal plein niveau dans le moniteur du sink — d'où la barre de volume qui bouge sans
 aucun son au haut-parleur.
 
+## Test décisif : le driver noyau est innocent
+
+En écrivant **directement dans `hw:1`** via ALSA mmap, sans PipeWire, avec la même
+période (1008) et le même buffer (34272) :
+
+| pré-remplissage avant `snd_pcm_start` | commit | débit matériel | xrun |
+|---|---|---|---|
+| tampon plein (34272) | 512 | 48 055 fps | 0 |
+| tampon plein (34272) | 1008 | 48 001 fps | 0 |
+| tampon plein (34272) | 1024 | 48 000 fps | 0 |
+| 512 frames | 512 | 0 fps (figé à 2016) | XRUN |
+
+Conclusion : le couple driver SST + firmware **accepte parfaitement des commits de
+512 frames**. Le blocage n'est pas une limite matérielle.
+
+Il vient du **démarrage** : si le flux est lancé avec moins d'une période en file, il
+part en underrun et ne se rétablit pas. Or PipeWire démarre le sink juste après le
+premier buffer, donc avec `quantum` frames seulement. À quantum ≥ 1024 il y a assez de
+marge ; à 512 non.
+
+Le correctif est donc côté **PipeWire** (marge de démarrage / headroom), pas dans le
+driver noyau.
+
 ## Pourquoi 1008 ?
 
 - `spa/plugins/alsa/alsa-pcm.h` : `DEFAULT_PERIOD = 1024`, `DEFAULT_RATE = 48000`.
@@ -78,16 +101,15 @@ Effet de bord : latence minimale ~10 ms → ~21 ms.
 
 ## Pistes pour un vrai correctif
 
-1. **PipeWire** : quand le nœud ALSA est le driver du graphe, ne pas laisser
-   `clock.target_duration` descendre sous la période négociée (`state->period_frames`),
-   ou renéogocier `period_size` quand le quantum diminue. C'est le comportement qui
-   serait correct pour tout périphérique dont le pointeur matériel avance par périodes
-   (`SNDRV_PCM_INFO_BLOCK_TRANSFER`).
-2. **Noyau** : `sst_media_prepare()` fait
+1. **PipeWire** (cause principale) : au démarrage d'un sink ALSA, attendre d'avoir au
+   moins une période en file (ou ajouter un `headroom` >= période) avant
+   `snd_pcm_start()`, au lieu de démarrer après le premier buffer de `quantum` frames.
+   C'est ce que fait `alsa_write_frames()` via `do_start()`.
+2. **PipeWire** (variante) : ne pas laisser `clock.target_duration` descendre sous la
+   période négociée (`state->period_frames`).
+3. **Noyau** (mineur, séparé) : `sst_media_prepare()` fait
    `substream->runtime->hw.info = SNDRV_PCM_INFO_BLOCK_TRANSFER;` (affectation, pas
-   `|=`) : il écrase tous les autres bits de `hw.info`. À vérifier séparément.
-3. **Driver SST** : comprendre pourquoi `hw_ptr` n'avance pas quand les commits sont
-   plus petits que la période (le firmware semble exiger des fragments entiers).
+   `|=`), ce qui écrase les autres bits de `hw.info`. Sans lien démontré avec ce bug.
 
 Ce dépôt ne contient volontairement pas de patch PipeWire : un correctif non compilé ni
 testé serait rejeté. Il documente le diagnostic, fournit un reproducer et le

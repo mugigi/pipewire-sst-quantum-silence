@@ -65,6 +65,26 @@ paplay tone.wav                                # sound is back
 Any player reproduces it (`paplay`, `aplay`, Chromium `<audio>` and Web Audio alike).
 It is *not* client-specific: the sink itself stops consuming.
 
+## The kernel driver is not at fault
+
+Writing directly to `hw:1` through ALSA mmap (no PipeWire), same period (1008) and
+buffer (34272), with the buffer fully pre-filled before `snd_pcm_start()`:
+
+| pre-fill before start | commit size | measured hw rate | xruns |
+|----------------------:|------------:|-----------------:|------:|
+| 34272 frames (full) | 512  | 48055 fps | 0 |
+| 34272 frames (full) | 1008 | 48001 fps | 0 |
+| 34272 frames (full) | 1024 | 48000 fps | 0 |
+| 512 frames          | 512  | 0 fps (stuck at 2016) | XRUN |
+
+So the SST driver/firmware handles 512-frame commits fine. The failure is a **startup
+underrun**: when the stream is started with less than a period queued, it underruns and
+does not recover. `alsa_write_frames()` starts the device right after the first buffer,
+i.e. with only `quantum` frames queued. With quantum >= 1024 there is enough slack; with
+512 there is not.
+
+Reproducer: `alsa_direct.py` (direct ALSA, bypasses PipeWire).
+
 ## Expected behaviour
 
 Playback should keep running whatever the graph quantum is (possibly with higher
@@ -84,12 +104,12 @@ This fixes it, at the cost of a ~21 ms minimum latency instead of ~10 ms.
 
 ## Possible directions
 
-1. In `alsa-pcm.c`, when the ALSA node is the graph driver, clamp
-   `pos->clock.target_duration` to at least `state->period_frames`, or renegotiate
-   `period_size` when the quantum goes below it.
-2. Check whether the driver's `SNDRV_PCM_INFO_BLOCK_TRANSFER` expectation is honoured
-   by the mmap commit path used by the ALSA plugin.
-3. Kernel side (separate issue): `sst_media_prepare()` assigns
+1. In `alsa_write_frames()` / `do_start()`, do not start a playback stream until at
+   least one full ALSA period (`state->period_frames`) is queued, or add a headroom of
+   at least one period for devices that underrun at startup. This is the main lead.
+2. Alternatively, clamp `pos->clock.target_duration` to `state->period_frames` when the
+   ALSA node is the graph driver, so the graph never runs below one period.
+3. Kernel (separate, unrelated): `sst_media_prepare()` assigns
    `substream->runtime->hw.info = SNDRV_PCM_INFO_BLOCK_TRANSFER;` instead of OR-ing it,
    which clears all other `hw.info` bits.
 
