@@ -1,0 +1,47 @@
+--- a/spa/plugins/alsa/alsa-pcm.c
++++ b/spa/plugins/alsa/alsa-pcm.c
+@@ -2136,6 +2136,17 @@
+ 		if (state->stream == SND_PCM_STREAM_CAPTURE)
+ 			state->headroom = SPA_MAX(state->headroom, 32u);
+ 	}
++	/* Block-transfer devices only consume data (and update their pointer)
++	 * in whole periods. When the graph quantum is not larger than the period,
++	 * keep at least two periods queued so that the stream does not underrun
++	 * at startup. Some firmware (e.g. Intel SST with ES8316) never recovers
++	 * from such a startup underrun and stays silent. */
++	if (state->stream == SND_PCM_STREAM_PLAYBACK &&
++	    state->is_block_transfer &&
++	    state->period_frames >= state->threshold)
++		state->headroom = SPA_MAX(state->headroom,
++				2 * state->period_frames - state->threshold);
++
+ 	if (SPA_LIKELY(state->buffer_frames >= state->threshold))
+ 		state->headroom = SPA_MIN(state->headroom, state->buffer_frames - state->threshold);
+ 	else
+@@ -2429,6 +2440,7 @@
+ 	dir = 0;
+ 	period_size = state->default_period_size;
+ 	state->is_batch = snd_pcm_hw_params_is_batch(params) && !state->disable_batch;
++	state->is_block_transfer = snd_pcm_hw_params_is_block_transfer(params);
+ 
+ 	default_period = SPA_SCALE32_UP(DEFAULT_PERIOD, state->rate, DEFAULT_RATE);
+ 	default_period = flp2(2 * default_period - 1);
+@@ -3172,6 +3184,8 @@
+ 		state->driver_duration = target_duration;
+ 		state->driver_rate = target_rate;
+ 		state->threshold = SPA_SCALE32_UP(state->driver_duration, state->rate, state->driver_rate.denom);
++		/* headroom depends on the ratio between the quantum and the period */
++		recalc_headroom(state);
+ 		state->max_error = SPA_MAX(256.0f, (state->threshold + state->headroom) / 2.0f);
+ 		state->max_resync = SPA_MIN(state->threshold + state->headroom, state->max_error);
+ 		state->err_wdw = (double)state->driver_rate.denom/state->driver_duration;
+--- a/spa/plugins/alsa/alsa-pcm.h
++++ b/spa/plugins/alsa/alsa-pcm.h
+@@ -235,6 +235,7 @@
+ 	unsigned int dsd_lsb:1;
+ 	unsigned int linked:1;
+ 	unsigned int is_batch:1;
++	unsigned int is_block_transfer:1;
+ 	unsigned int force_quantum:1;
+ 	unsigned int use_period_size_min_as_headroom:1;
+ 

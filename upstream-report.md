@@ -77,13 +77,71 @@ buffer (34272), with the buffer fully pre-filled before `snd_pcm_start()`:
 | 34272 frames (full) | 1024 | 48000 fps | 0 |
 | 512 frames          | 512  | 0 fps (stuck at 2016) | XRUN |
 
+Sweeping the pre-fill with a constant 512-frame commit size gives a sharp threshold:
+
+| pre-fill before `snd_pcm_start` | result |
+|---|---|
+| 512 / 1008 / 1512 frames | XRUN, `hw_ptr` frozen |
+| **2016 frames (2 periods) and above** | ~48000 fps, 0 xruns |
+
 So the SST driver/firmware handles 512-frame commits fine. The failure is a **startup
-underrun**: when the stream is started with less than a period queued, it underruns and
-does not recover. `alsa_write_frames()` starts the device right after the first buffer,
-i.e. with only `quantum` frames queued. With quantum >= 1024 there is enough slack; with
-512 there is not.
+underrun**: the firmware needs at least **two periods (2016 frames)** queued before it
+starts. Below that it underruns and never recovers. `alsa_write_frames()` primes
+`threshold` frames and then writes one graph buffer of `threshold` frames, so with
+quantum <= 1008 the stream never has more than 2016 frames queued at start (and usually
+less). With quantum >= 1024, `2 * quantum > 2016`, which is why it works.
 
 Reproducer: `alsa_direct.py` (direct ALSA, bypasses PipeWire).
+
+## Proposed fix
+
+The device reports `SNDRV_PCM_INFO_BLOCK_TRANSFER`
+(`snd_pcm_hw_params_is_block_transfer() == 1`), i.e. it consumes data only in whole
+periods. That is exactly the class of hardware affected by this startup behaviour.
+
+The attached patch (`0001-alsa-pcm-keep-two-periods-queued-for-block-transfer.patch`):
+
+1. stores `is_block_transfer` when the hw params are negotiated;
+2. in `recalc_headroom()`, for playback on a block-transfer device whose graph quantum
+   is not larger than the ALSA period, enforces `headroom = 2 * period - quantum`, i.e.
+   keeps **two periods** queued;
+3. calls `recalc_headroom()` when the quantum changes so the margin follows the graph.
+
+```c
+/* Block-transfer devices only consume data (and update their pointer)
+ * in whole periods. When the graph quantum is not larger than the period,
+ * keep at least two periods queued so that the stream does not underrun
+ * at startup. Some firmware (e.g. Intel SST with ES8316) never recovers
+ * from such a startup underrun and stays silent. */
+if (state->stream == SND_PCM_STREAM_PLAYBACK &&
+    state->is_block_transfer &&
+    state->period_frames >= state->threshold)
+	state->headroom = SPA_MAX(state->headroom,
+			2 * state->period_frames - state->threshold);
+```
+
+The condition is generic: it names no card, only the ALSA `BLOCK_TRANSFER` capability.
+The extra latency (~2 periods, 42 ms at 48 kHz) applies only to block-transfer playback
+devices and only while the quantum is <= the period. Larger quantums and other devices
+are unchanged.
+
+## Test results with the patch
+
+PipeWire 1.6.10 built from source with the patch, isolated instance, `paplay` 440 Hz,
+`hw_ptr` sampled from `/proc/asound/card1/pcm0p/sub0/status`:
+
+| forced quantum | period | state | measured hw rate | xruns (10 s) |
+|---------------:|-------:|:-----:|-----------------:|-------------:|
+| 128  | 1008 | RUNNING | 48182 fps | 0 |
+| 512  | 1008 | RUNNING | 48182 fps | 0 |
+| 1008 | 1008 | RUNNING | 48081 fps | 0 |
+| 1024 | 1008 | RUNNING | 48384 fps | 0 |
+| 2048 | 1008 | RUNNING | 48384 fps | 0 |
+
+Before the patch, quantum 128/512/768/1008 all reported 0 fps and `XRUN`.
+
+Reproduce with `test-isolated.sh build/spa/plugins/alsa 128 512 1008 1024` (starts a
+private PipeWire instance with the patched plugin and measures `hw_ptr`).
 
 ## Expected behaviour
 
@@ -102,16 +160,18 @@ context.properties = {
 
 This fixes it, at the cost of a ~21 ms minimum latency instead of ~10 ms.
 
-## Possible directions
+## Discussion
 
-1. In `alsa_write_frames()` / `do_start()`, do not start a playback stream until at
-   least one full ALSA period (`state->period_frames`) is queued, or add a headroom of
-   at least one period for devices that underrun at startup. This is the main lead.
-2. Alternatively, clamp `pos->clock.target_duration` to `state->period_frames` when the
-   ALSA node is the graph driver, so the graph never runs below one period.
+1. The attached patch implements the fix in `recalc_headroom()`, reusing the existing
+   headroom mechanism and the ALSA `BLOCK_TRANSFER` capability. It avoids special-casing
+   any card.
+2. An alternative would be to refuse a graph quantum below `state->period_frames` for
+   block-transfer devices, but that would change scheduling for the whole graph and
+   could affect unrelated nodes.
 3. Kernel (separate, unrelated): `sst_media_prepare()` assigns
    `substream->runtime->hw.info = SNDRV_PCM_INFO_BLOCK_TRANSFER;` instead of OR-ing it,
-   which clears all other `hw.info` bits.
+   which clears all other `hw.info` bits. Worth a separate report, but it is not the
+   cause of this issue (the capability is already reported correctly at hw_params time).
 
 ## Attachments to add
 

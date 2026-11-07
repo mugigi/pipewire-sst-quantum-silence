@@ -33,16 +33,52 @@ période (1008) et le même buffer (34272) :
 | tampon plein (34272) | 1024 | 48 000 fps | 0 |
 | 512 frames | 512 | 0 fps (figé à 2016) | XRUN |
 
+En balayant le pré-remplissage à commit constant de 512 frames :
+
+| pré-remplissage | résultat |
+|---|---|
+| 512, 1008, 1512 frames | XRUN, `hw_ptr` figé |
+| **2016 frames et plus** | ~48 000 fps, 0 xrun |
+
 Conclusion : le couple driver SST + firmware **accepte parfaitement des commits de
 512 frames**. Le blocage n'est pas une limite matérielle.
 
-Il vient du **démarrage** : si le flux est lancé avec moins d'une période en file, il
-part en underrun et ne se rétablit pas. Or PipeWire démarre le sink juste après le
-premier buffer, donc avec `quantum` frames seulement. À quantum ≥ 1024 il y a assez de
-marge ; à 512 non.
+Il vient du **démarrage** : le firmware exige **au moins deux périodes (2016 frames)**
+en file avant de démarrer. En dessous, il part en underrun et ne se rétablit pas. Or
+PipeWire amorce `threshold` frames puis écrit un premier buffer de `threshold` frames :
+à quantum ≤ 1008 il n'y a donc jamais plus de 2016 frames au démarrage (et parfois
+moins), d'où le blocage. Dès que `2 × quantum > 2016` (quantum > 1008, donc ≥ 1024 en
+pratique), tout fonctionne.
 
-Le correctif est donc côté **PipeWire** (marge de démarrage / headroom), pas dans le
+Le correctif est donc côté **PipeWire** (marge de démarrage / `headroom`), pas dans le
 driver noyau.
+
+## Correctif proposé et validé
+
+Le périphérique expose `SNDRV_PCM_INFO_BLOCK_TRANSFER` (`snd_pcm_hw_params_is_block_transfer()
+== 1`), c'est-à-dire qu'il ne consomme les données que par blocs entiers d'une période.
+C'est exactement la classe de matériel concernée.
+
+Le patch `0001-alsa-pcm-keep-two-periods-queued-for-block-transfer.patch` :
+
+1. mémorise `is_block_transfer` à l'ouverture des hw params ;
+2. dans `recalc_headroom()`, pour un playback block-transfer dont le quantum n'excède pas
+   la période, impose `headroom = 2 × période − quantum`, soit **2 périodes en file** ;
+3. rappelle `recalc_headroom()` quand le quantum change, pour que la marge suive.
+
+Résultat mesuré sur la machine (PipeWire 1.6.10 compilé avec le patch, `paplay`, 10 s) :
+
+| quantum | période | état | débit matériel | xrun |
+|---|---|---|---|---|
+| 128  | 1008 | RUNNING | 48 182 fps | 0 |
+| 512  | 1008 | RUNNING | 48 182 fps | 0 |
+| 1008 | 1008 | RUNNING | 48 081 fps | 0 |
+| 1024 | 1008 | RUNNING | 48 384 fps | 0 |
+| 2048 | 1008 | RUNNING | 48 384 fps | 0 |
+
+Coût : ~2 périodes de latence supplémentaire (42 ms à 48 kHz) **uniquement** pour les
+périphériques block-transfer et **uniquement** quand le quantum ≤ période. Les autres
+périphériques et les quantums supérieurs ne changent pas.
 
 ## Pourquoi 1008 ?
 
@@ -81,10 +117,29 @@ cat /proc/asound/card1/pcm0p/sub0/status
 pw-metadata -n settings 0 clock.force-quantum 1024
 ```
 
-Test automatisé utilisé pour le tableau ci-dessus :
-`/tmp/opencode/hwptr_test.sh` (échantillonne `hw_ptr` dans `/proc/asound`).
+Test automatisé utilisé pour le tableau ci-dessus : `hwptr-quantum-test.sh`
+(échantillonne `hw_ptr` dans `/proc/asound`).
 
-## Contournement appliqué (permanent)
+## Appliquer et compiler le patch
+
+```bash
+tar xf pipewire-1.6.10.tar.gz
+cd pipewire-1.6.10
+patch -p1 < ../0001-alsa-pcm-keep-two-periods-queued-for-block-transfer.patch
+meson setup build -Dauto_features=disabled -Dsession-managers=[] \
+      -Dspa-plugins=enabled -Dalsa=enabled -Dudev=enabled \
+      -Dtests=disabled -Dexamples=disabled -Ddocs=disabled -Dman=disabled
+ninja -C build spa/plugins/alsa/libspa-alsa.so
+```
+
+Puis tester le plugin dans une instance PipeWire isolée (services utilisateur
+arrêtés/restaurés automatiquement) :
+
+```bash
+./test-isolated.sh build/spa/plugins/alsa 128 512 1008 1024
+```
+
+## Contournement historique (optionnel)
 
 `~/.config/pipewire/pipewire.conf.d/99-min-quantum.conf` :
 
@@ -99,28 +154,29 @@ Puis `systemctl --user restart pipewire wireplumber pipewire-pulse`.
 
 Effet de bord : latence minimale ~10 ms → ~21 ms.
 
-## Pistes pour un vrai correctif
+## Pistes upstream
 
-1. **PipeWire** (cause principale) : au démarrage d'un sink ALSA, attendre d'avoir au
-   moins une période en file (ou ajouter un `headroom` >= période) avant
-   `snd_pcm_start()`, au lieu de démarrer après le premier buffer de `quantum` frames.
-   C'est ce que fait `alsa_write_frames()` via `do_start()`.
-2. **PipeWire** (variante) : ne pas laisser `clock.target_duration` descendre sous la
-   période négociée (`state->period_frames`).
-3. **Noyau** (mineur, séparé) : `sst_media_prepare()` fait
+Le correctif ci-dessus est implémenté, compilé et testé. Pour l'upstream, deux points
+méritent discussion :
+
+1. **PipeWire** : la condition `is_block_transfer && quantum <= période` est générique
+   (elle ne nomme aucune carte) et correspond à la sémantique ALSA de
+   `SNDRV_PCM_INFO_BLOCK_TRANSFER`. C'est la piste retenue.
+2. **Noyau** (mineur, séparé) : `sst_media_prepare()` fait
    `substream->runtime->hw.info = SNDRV_PCM_INFO_BLOCK_TRANSFER;` (affectation, pas
-   `|=`), ce qui écrase les autres bits de `hw.info`. Sans lien démontré avec ce bug.
-
-Ce dépôt ne contient volontairement pas de patch PipeWire : un correctif non compilé ni
-testé serait rejeté. Il documente le diagnostic, fournit un reproducer et le
-contournement, pour servir de base à une issue upstream.
+   `|=`), ce qui écrase les autres bits de `hw.info`. Sans lien démontré avec ce bug,
+   mais à signaler séparément.
 
 ## Fichiers
 
+- `0001-alsa-pcm-keep-two-periods-queued-for-block-transfer.patch` — le correctif
+  PipeWire (`patch -p1` dans une source 1.6.10).
 - `hwptr-quantum-test.sh` — reproducer autonome (aucune écoute nécessaire : il lit
   `hw_ptr` et affiche le débit réel du DSP).
+- `alsa_direct.py` — reproducer direct-ALSA qui a exonéré le driver noyau.
+- `test-isolated.sh` — banc de test isolé (instance PipeWire privée + mesure `hw_ptr`).
 - `upstream-report.md` — rapport prêt à coller dans une issue GitLab PipeWire.
-- `99-min-quantum.conf` — le contournement.
+- `99-min-quantum.conf` — le contournement historique (plus nécessaire avec le patch).
 
 ```bash
 ./hwptr-quantum-test.sh 512 1024
