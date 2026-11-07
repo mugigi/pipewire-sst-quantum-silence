@@ -140,6 +140,21 @@ PipeWire 1.6.10 built from source with the patch, isolated instance, `paplay` 44
 
 Before the patch, quantum 128/512/768/1008 all reported 0 fps and `XRUN`.
 
+The same patch was then installed on the real system
+(`/usr/lib/spa-0.2/alsa/libspa-alsa.so`), the `99-min-quantum.conf` workaround was
+removed, and the original scenario was replayed end to end:
+
+| scenario | effective quantum | state | `hw_ptr` rate | `ERR` (pw-top) |
+|---|---|---:|---:|---:|
+| `paplay`, default | 1024 | RUNNING | 48384 fps | 0 |
+| `paplay`, forced | 512 | RUNNING | 48384 fps | 0 |
+| `paplay`, forced | 128 | RUNNING | 48384 fps | 0 |
+| **Chromium + Web Audio** | **512 (requested by Chromium)** | RUNNING | 48384 fps | 0 |
+
+Chromium/Web Audio drives the graph down to 512 on its own (no forcing). Over 10 s the
+sink stays at 512, `ERR` remains 0 and `hw_ptr` advances at ~48 kHz. This is the exact
+case that used to be silent.
+
 Reproduce with `test-isolated.sh build/spa/plugins/alsa 128 512 1008 1024` (starts a
 private PipeWire instance with the patched plugin and measures `hw_ptr`).
 

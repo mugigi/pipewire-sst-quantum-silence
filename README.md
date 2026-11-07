@@ -80,6 +80,27 @@ Coût : ~2 périodes de latence supplémentaire (42 ms à 48 kHz) **uniquement**
 périphériques block-transfer et **uniquement** quand le quantum ≤ période. Les autres
 périphériques et les quantums supérieurs ne changent pas.
 
+## Validation sur la machine (plugin installé)
+
+Le plugin compilé (`sha256 91f16d93…`, PipeWire 1.6.10) a été installé dans
+`/usr/lib/spa-0.2/alsa/libspa-alsa.so`, puis le contournement `99-min-quantum.conf` a
+été retiré. Configuration effective : `clock.quantum = 1024`,
+`clock.min-quantum = 32`, aucun quantum forcé.
+
+| scénario | quantum effectif | état | débit `hw_ptr` | `ERR` |
+|---|---|---|---|---|
+| `paplay`, défaut | 1024 | RUNNING | 48 384 fps | 0 |
+| `paplay`, forcé | 512 | RUNNING | 48 384 fps | 0 |
+| `paplay`, forcé | 128 | RUNNING | 48 384 fps | 0 |
+| `paplay`, forcé | 1008 | RUNNING | 48 384 fps | 0 |
+| **Chromium + Web Audio** | **512 (choisi par Chromium)** | RUNNING | 48 384 fps | 0 |
+
+Le dernier cas est le scénario d'origine : Chromium/Web Audio fait descendre le graphe
+à 512 tout seul, sans forçage. Sur 10 s, `ERR=0` et `hw_ptr` avance à ~48 kHz.
+
+Note : `/usr/lib/spa-0.2/alsa/libspa-alsa.so` appartient au paquet `pipewire-audio` ;
+une mise à jour de PipeWire écrasera le plugin patché.
+
 ## Pourquoi 1008 ?
 
 - `spa/plugins/alsa/alsa-pcm.h` : `DEFAULT_PERIOD = 1024`, `DEFAULT_RATE = 48000`.
